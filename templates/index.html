@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VeriFact — Fake News Detector</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  <style>
+    .insight-box { background: #f9f9f9; border-radius: 8px; padding: 1.5rem; margin-bottom: 1rem; border: 1px solid #e0e0e0; }
+    .insight-box h4 { margin: 0 0 0.75rem 0; color: #222; font-size: 0.95rem; font-weight: 600; }
+    .insight-box p { margin: 0.5rem 0; font-size: 0.9rem; color: #333; }
+    .insight-box pre { margin: 0; font-size: 0.85rem; color: #555; white-space: pre-wrap; word-wrap: break-word; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <h1>VeriFact</h1>
+      <p class="tagline">AI-powered fake news detector using vision, text, and web research.</p>
+      {% if artifact_status != 'ready' %}
+      <div class="banner warn">
+        <strong>Artifacts missing.</strong> Expected files under <code>{{ base_dir }}/outputs/</code>.
+        {% if missing_artifacts %}Missing: {{ missing_artifacts }}.{% endif %}
+      </div>
+      {% endif %}
+    </header>
+
+    <main class="grid">
+      <section class="card panel">
+        <h2>Check a Story</h2>
+        <form id="analyze-form">
+          <label class="field">
+            <span>News text <span class="req">*</span></span>
+            <textarea name="text" id="text-input" rows="8" placeholder="Paste headline or article text…" required></textarea>
+          </label>
+
+          <label class="field">
+            <span>Optional image</span>
+            <input type="file" name="image" id="image-input" accept="image/jpeg,image/png,image/webp,image/gif,image/bmp" />
+            <small class="hint">Add an image to enable visual analysis.</small>
+          </label>
+
+          <button type="submit" id="submit-btn" class="btn primary">Analyze</button>
+        </form>
+        <p id="status" class="status" aria-live="polite"></p>
+      </section>
+
+      <section class="card results" id="results-panel" hidden>
+        <h2>Result</h2>
+        <div class="final-box" id="final-summary"></div>
+        
+        <div id="insights-column" style="margin-top: 2rem;"></div>
+        
+        <details class="raw-json" style="margin-top: 2rem;">
+          <summary>View detailed results</summary>
+          <pre id="raw-out"></pre>
+        </details>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>VeriFact analyzes text, images, and web sources to help you identify misinformation.</span>
+    </footer>
+  </div>
+
+  <script>
+    const form = document.getElementById('analyze-form');
+    const statusEl = document.getElementById('status');
+    const resultsPanel = document.getElementById('results-panel');
+    const finalSummary = document.getElementById('final-summary');
+    const insightsColumn = document.getElementById('insights-column');
+    const rawOut = document.getElementById('raw-out');
+    const submitBtn = document.getElementById('submit-btn');
+
+    function esc(s) {
+      const d = document.createElement('div');
+      d.textContent = s == null ? '' : String(s);
+      return d.innerHTML;
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      statusEl.textContent = 'Analyzing…';
+      resultsPanel.hidden = true;
+      submitBtn.disabled = true;
+
+      const fd = new FormData(form);
+      fd.set('threshold', '0.5');
+
+      try {
+        const res = await fetch('/api/analyze', { method: 'POST', body: fd });
+        const data = await res.json();
+        rawOut.textContent = JSON.stringify(data, null, 2);
+
+        if (!data.ok) {
+          let msg = data.error || 'Request failed';
+          if (data.detail) {
+            msg += '\n\n' + String(data.detail).slice(0, 4000);
+          }
+          statusEl.textContent = msg;
+          submitBtn.disabled = false;
+          return;
+        }
+
+        statusEl.textContent = '';
+        const ens = data.ensemble;
+        const labelClass = ens.final_label === 'FAKE' ? 'fake' : 'real';
+        const confidence = Math.round(ens.confidence_for_label * 100);
+        
+        finalSummary.innerHTML =
+          '<div class="label-pill ' + labelClass + '">' + esc(ens.final_label) + '</div>' +
+          '<p class="scores"><strong>' + confidence + '% confidence</strong></p>';
+
+        // Build insights panel
+        let insightsHtml = '';
+
+        // BLIP caption (if available)
+        const b1 = data.branches.branch1;
+        if (b1.caption && !b1.disabled) {
+          insightsHtml += '<div class="insight-box"><h4>📷 BLIP Image Analysis</h4><p>' + esc(b1.caption) + '</p></div>';
+        }
+
+        // OSINT summary (if available)
+        const b3 = data.branches.branch3;
+        if (!b3.disabled && b3.ddg_text_hits) {
+          insightsHtml += '<div class="insight-box"><h4>🔍 Web Search (OSINT)</h4>';
+          insightsHtml += '<p><strong>' + b3.ddg_text_hits + ' results found</strong> from web search</p>';
+          if (b3.result_domains && b3.result_domains.length > 0) {
+            insightsHtml += '<p style="font-size:0.85rem; margin-top:0.5rem; color:#555;"><strong>Websites checked:</strong></p>';
+            insightsHtml += '<p style="font-size:0.85rem; margin:0.25rem 0; color:#666;">' + esc(b3.result_domains.join(' • ')) + '</p>';
+          }
+          if (b3.signals) {
+            insightsHtml += '<div style="margin-top:0.75rem; padding-top:0.75rem; border-top:1px solid #ddd;">';
+            if (b3.signals.fact_checker_domain_hit) insightsHtml += '<p style="margin:0.25rem 0; color:#27ae60;">✓ Fact-checker domain mentioned</p>';
+            if (b3.signals.debunk_language_in_snippets) insightsHtml += '<p style="margin:0.25rem 0; color:#e74c3c;">✓ Debunk language detected</p>';
+            if (b3.signals.verification_language_in_snippets) insightsHtml += '<p style="margin:0.25rem 0; color:#27ae60;">✓ Verification language detected</p>';
+            insightsHtml += '</div>';
+          }
+          insightsHtml += '</div>';
+        }
+
+        // Model weights breakdown
+        const w = data.weights;
+        if (w.branch1 > 0 || w.branch2 > 0 || w.branch3 > 0) {
+          insightsHtml += '<div class="insight-box"><h4>⚖️ Model Weights</h4>';
+          if (w.branch1 > 0) insightsHtml += '<p><strong>Vision:</strong> ' + Math.round(w.branch1 * 100) + '%</p>';
+          if (w.branch2 > 0) insightsHtml += '<p><strong>Text Analysis:</strong> ' + Math.round(w.branch2 * 100) + '%</p>';
+          if (w.branch3 > 0) insightsHtml += '<p><strong>Web Research:</strong> ' + Math.round(w.branch3 * 100) + '%</p>';
+          insightsHtml += '</div>';
+        }
+
+        insightsColumn.innerHTML = insightsHtml;
+        resultsPanel.hidden = false;
+      } catch (err) {
+        statusEl.textContent = 'Network or server error: ' + err;
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

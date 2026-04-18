@@ -1,0 +1,23 @@
+# Flask UI + VeriFact pipeline (see VeriFact_Final.ipynb)
+flask>=3.0
+
+tensorflow>=2.21
+keras>=3.0
+torch>=2.1
+transformers>=4.36
+accelerate>=0.26
+sentencepiece
+sentence-transformers>=2.2
+bitsandbytes; sys_platform != "darwin" or platform_machine != "arm64"
+
+Pillow>=10.0
+numpy>=1.23.5,<2.0.0
+pandas>=2.0
+scikit-learn>=1.3
+joblib>=1.3
+
+# DuckDuckGo search (notebook used `pip install ddgs`; this meta-package also works)
+duckduckgo-search>=6.0
+
+requests>=2.31
+ImageHash>=4.3
