@@ -4,13 +4,25 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Local tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # Ignore virtual environments
 env/
 venv/
 tf_env/
+.venv/
+.venv311/
 
 # Ignore Jupyter notebook checkpoints
 .ipynb_checkpoints/
+
+# Runtime-generated app files
+uploads/
+outputs/sklearn_load_debug.log
+*.log
 
 # Ignore OS-specific files
 .DS_Store

@@ -12,12 +12,16 @@ import os
 import pickle
 import re
 import threading
+import time
 import warnings
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import imagehash
+try:
+    import imagehash
+except ImportError:  # pragma: no cover - optional runtime dependency
+    imagehash = None
 import joblib
 import numpy as np
 import pandas as pd
@@ -75,8 +79,7 @@ except Exception:
     pass
 
 try:
-    from ddgs import DDGS 
-      # noqa: ICN003
+    from ddgs import DDGS  # noqa: ICN003
 except ImportError:
     from duckduckgo_search import DDGS  # type: ignore[no-redef]
 from PIL import Image
@@ -125,8 +128,69 @@ def _load_keras2_h5(path: str) -> Any:
 
 
 ENSEMBLE_W1, ENSEMBLE_W2, ENSEMBLE_W3 = 0.45, 0.05, 0.5
-BLIP2_MODEL_ID = "Salesforce/blip2-opt-2.7b"
+B1_CAPTION_MODEL_ID = os.environ.get(
+    "VERIFACT_B1_CAPTION_MODEL",
+    "Salesforce/blip-image-captioning-base",
+)
 SIM_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return max(minimum, default)
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return max(minimum, default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+DDG_TEXT_MAX_RESULTS = _env_int("VERIFACT_DDG_TEXT_MAX_RESULTS", 5)
+DDG_IMAGE_MAX_RESULTS = _env_int("VERIFACT_DDG_IMAGE_MAX_RESULTS", 1)
+DDG_RETRY_ATTEMPTS = _env_int("VERIFACT_DDG_RETRY_ATTEMPTS", 3)
+DDG_RETRY_DELAY_SEC = _env_float("VERIFACT_DDG_RETRY_DELAY_SEC", 0.35)
+
+# Fast mode is meant for live demos where response time matters more than depth.
+FAST_DDG_TEXT_MAX_RESULTS = _env_int("VERIFACT_FAST_DDG_TEXT_MAX_RESULTS", 3)
+FAST_DDG_RETRY_ATTEMPTS = _env_int("VERIFACT_FAST_DDG_RETRY_ATTEMPTS", 1)
+FAST_SKIP_IMAGE_HASH = os.environ.get("VERIFACT_FAST_SKIP_IMAGE_HASH", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+# Cache DDG text responses to avoid repeated network latency on similar queries.
+DDG_CACHE_TTL_SEC = _env_float("VERIFACT_DDG_CACHE_TTL_SEC", 900.0)
+DDG_CACHE_MAX_SIZE = _env_int("VERIFACT_DDG_CACHE_MAX_SIZE", 200)
+B1_ALLOW_SIMILARITY_FALLBACK = _env_bool("VERIFACT_B1_ALLOW_SIMILARITY_FALLBACK", True)
+SINGLE_BRANCH_FAKE_THRESHOLD = _env_float("VERIFACT_SINGLE_BRANCH_FAKE_THRESHOLD", 0.62)
+B3_RF_EVIDENCE_FLOOR = _env_float("VERIFACT_B3_RF_EVIDENCE_FLOOR", 0.35)
+
+
+def _load_joblib_with_pickle_fallback(path: Path, label: str, debug_log: list[str] | None = None) -> Any:
+    """
+    Load a pickled artifact with a compatibility fallback for NumPy BitGenerator state issues.
+    """
+    try:
+        return joblib.load(path)
+    except TypeError as exc:
+        err_txt = str(exc)
+        if "BitGenerator" not in err_txt or "__setstate__" not in err_txt:
+            raise
+        if debug_log is not None:
+            debug_log.append(f"{label} BitGenerator compatibility fallback engaged")
+        with open(path, "rb") as fh:
+            return pickle.load(fh)
 
 
 def _base_dir() -> Path:
@@ -158,6 +222,13 @@ class VeriFactEngine:
         paths = artifact_paths(self.base_dir)
         self.paths = paths
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._b1_caption_model_id = B1_CAPTION_MODEL_ID
+        self._b1_allow_similarity_fallback = B1_ALLOW_SIMILARITY_FALLBACK
+        self._allow_cpu_blip = os.environ.get("VERIFACT_ALLOW_CPU_BLIP", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
 
         self._tf_ready = False
         self._b2_model = None
@@ -177,6 +248,11 @@ class VeriFactEngine:
         self._ddgs: DDGS | None = None
         self._b1_available = False  # Track if Branch 1 sklearn files exist
         self._b3_available = False  # Track if Branch 3 sklearn files exist
+        self._b1_load_error: str | None = None
+        self._b3_load_error: str | None = None
+        self._b1_runtime_error: str | None = None
+        self._ddgs_error: str | None = None
+        self._ddg_text_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
     @classmethod
     def get(cls, base_dir: Path | None = None) -> VeriFactEngine:
@@ -209,22 +285,143 @@ class VeriFactEngine:
     def ensure_torch_branch1(self) -> None:
         if self._torch_ready:
             return
-        from transformers import Blip2ForConditionalGeneration, Blip2Processor
+
+        if self.device != "cuda" and not self._allow_cpu_blip:
+            self._b1_runtime_error = (
+                "Branch 1 caption model is disabled on CPU-only runtime for reliability. "
+                "Set VERIFACT_ALLOW_CPU_BLIP=1 to force CPU inference (slow), "
+                "or deploy on GPU."
+            )
+            return
+
+        model_id = str(self._b1_caption_model_id)
+        use_blip2 = "blip2" in model_id.lower()
+
+        if use_blip2:
+            from transformers import Blip2ForConditionalGeneration as CaptionModelClass
+            from transformers import Blip2Processor as CaptionProcessorClass
+        else:
+            from transformers import BlipForConditionalGeneration as CaptionModelClass
+            from transformers import BlipProcessor as CaptionProcessorClass
         from sentence_transformers import SentenceTransformer
 
-        print("Loading BLIP-2 (Branch 1)...")
-        dtype = torch.float16 if self.device == "cuda" else torch.float32
-        self._blip2_processor = Blip2Processor.from_pretrained(BLIP2_MODEL_ID)
-        self._blip2_model = Blip2ForConditionalGeneration.from_pretrained(
-            BLIP2_MODEL_ID,
-            torch_dtype=dtype,
-            device_map="auto" if self.device == "cuda" else None,
-        )
-        self._blip2_model.eval()
-        if self.device != "cuda":
-            self._blip2_model.to(self.device)
-        self._sim_model = SentenceTransformer(SIM_MODEL_ID, device=self.device)
-        self._torch_ready = True
+        print(f"Loading Branch 1 caption model: {model_id}...")
+        try:
+            dtype = torch.float16 if self.device == "cuda" else torch.float32
+            self._blip2_processor = CaptionProcessorClass.from_pretrained(model_id)
+            self._blip2_model = CaptionModelClass.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+                device_map="auto" if self.device == "cuda" else None,
+            )
+            self._blip2_model.eval()
+            if self.device != "cuda":
+                self._blip2_model.to(self.device)
+            self._sim_model = SentenceTransformer(SIM_MODEL_ID, device=self.device)
+            self._b1_runtime_error = None
+            self._torch_ready = True
+        except Exception as exc:
+            self._b1_runtime_error = (
+                f"Branch 1 caption model init failed for '{model_id}' ({type(exc).__name__}): {exc}. "
+                "Deploy on a GPU node with sufficient VRAM, or temporarily disable Branch 1."
+            )
+            self._torch_ready = False
+
+    def _init_ddgs(self, debug_log: list[str] | None = None) -> None:
+        try:
+            try:
+                self._ddgs = DDGS(timeout=10)
+            except TypeError:
+                # Older implementations may not support timeout argument.
+                self._ddgs = DDGS()
+            self._ddgs_error = None
+            if debug_log is not None:
+                debug_log.append("DDGS initialized")
+        except Exception as exc:
+            self._ddgs = None
+            self._ddgs_error = f"{type(exc).__name__}: {exc}"
+            if debug_log is not None:
+                debug_log.append(f"DDGS init error: {self._ddgs_error}")
+
+    @staticmethod
+    def _normalize_query(query: str) -> str:
+        return re.sub(r"\s+", " ", str(query).strip().lower())
+
+    def _ddg_cache_get(self, query: str, max_results: int) -> list[dict[str, Any]] | None:
+        key = self._normalize_query(query)
+        cached = self._ddg_text_cache.get(key)
+        if not cached:
+            return None
+        ts, rows = cached
+        if (time.time() - ts) > DDG_CACHE_TTL_SEC:
+            self._ddg_text_cache.pop(key, None)
+            return None
+        return list(rows[:max_results])
+
+    def _ddg_cache_set(self, query: str, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        key = self._normalize_query(query)
+        self._ddg_text_cache[key] = (time.time(), rows)
+        if len(self._ddg_text_cache) <= DDG_CACHE_MAX_SIZE:
+            return
+        oldest_key = min(self._ddg_text_cache.items(), key=lambda item: item[1][0])[0]
+        self._ddg_text_cache.pop(oldest_key, None)
+
+    def _ddg_text_search(
+        self,
+        query: str,
+        max_results: int,
+        retry_attempts: int | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        errors: list[str] = []
+        attempt_limit = max(1, retry_attempts or DDG_RETRY_ATTEMPTS)
+
+        cached = self._ddg_cache_get(query, max_results=max_results)
+        if cached is not None:
+            return cached, errors
+
+        for attempt in range(1, attempt_limit + 1):
+            if not self._ddgs:
+                self._init_ddgs()
+            if not self._ddgs:
+                errors.append(f"attempt {attempt}: {self._ddgs_error or 'DDGS unavailable'}")
+                time.sleep(DDG_RETRY_DELAY_SEC)
+                continue
+            try:
+                results = list(self._ddgs.text(query, max_results=max_results))
+                self._ddg_cache_set(query, results)
+                return results, errors
+            except Exception as exc:
+                errors.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
+                self._ddgs = None
+                time.sleep(DDG_RETRY_DELAY_SEC)
+        return [], errors
+
+    def _ddg_image_search(
+        self,
+        query: str,
+        max_results: int,
+        retry_attempts: int | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        errors: list[str] = []
+        attempt_limit = max(1, retry_attempts or DDG_RETRY_ATTEMPTS)
+
+        for attempt in range(1, attempt_limit + 1):
+            if not self._ddgs:
+                self._init_ddgs()
+            if not self._ddgs:
+                errors.append(f"attempt {attempt}: {self._ddgs_error or 'DDGS unavailable'}")
+                time.sleep(DDG_RETRY_DELAY_SEC)
+                continue
+            try:
+                results = list(self._ddgs.images(query, max_results=max_results))
+                return results, errors
+            except Exception as exc:
+                errors.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
+                self._ddgs = None
+                time.sleep(DDG_RETRY_DELAY_SEC)
+        return [], errors
 
     def ensure_sklearn_branches(self) -> None:
         if self._sk_ready:
@@ -234,50 +431,42 @@ class VeriFactEngine:
         
         # Try to load Branch 1 sklearn files (optional)
         self._b1_available = False
+        self._b1_load_error = None
         try:
             if self.paths["b1_clf"].exists() and self.paths["b1_scaler"].exists():
                 debug_log.append("Starting B1 loads...")
-                try:
-                    self._b1_clf = joblib.load(self.paths["b1_clf"])
-                    debug_log.append("B1 clf loaded OK")
-                except TypeError as e:
-                    if "BitGenerator" in str(e) and "__setstate__" in str(e):
-                        debug_log.append(f"B1 clf BitGenerator error (expected): {str(e)[:100]}")
-                        debug_log.append("Attempting direct load with fallback unpickler...")
-                        # Try with protocol 2 reading manually
-                        with open(self.paths["b1_clf"], "rb") as f:
-                            import pickle
-                            try:
-                                self._b1_clf = pickle.load(f)
-                                debug_log.append("B1 clf loaded via pickle (fallback)")
-                            except:
-                                raise
-                
-                try:
-                    self._b1_scaler = joblib.load(self.paths["b1_scaler"])
-                    debug_log.append("B1 scaler loaded OK")
-                except TypeError as e:
-                    if "BitGenerator" in str(e) and "__setstate__" in str(e):
-                        debug_log.append(f"B1 scaler BitGenerator error (expected): {str(e)[:100]}")
-                        with open(self.paths["b1_scaler"], "rb") as f:
-                            import pickle
-                            try:
-                                self._b1_scaler = pickle.load(f)
-                                debug_log.append("B1 scaler loaded via pickle (fallback)")
-                            except:
-                                raise
+                self._b1_clf = _load_joblib_with_pickle_fallback(
+                    self.paths["b1_clf"],
+                    "B1 classifier",
+                    debug_log,
+                )
+                debug_log.append("B1 clf loaded OK")
+                self._b1_scaler = _load_joblib_with_pickle_fallback(
+                    self.paths["b1_scaler"],
+                    "B1 scaler",
+                    debug_log,
+                )
+                debug_log.append("B1 scaler loaded OK")
                 
                 self._b1_available = True
                 debug_log.append("✓ B1 LOADED")
             else:
-                debug_log.append("B1 files missing")
+                missing = [
+                    str(self.paths["b1_clf"].name) if not self.paths["b1_clf"].exists() else "",
+                    str(self.paths["b1_scaler"].name) if not self.paths["b1_scaler"].exists() else "",
+                ]
+                missing_txt = ", ".join([m for m in missing if m])
+                self._b1_load_error = f"Missing Branch 1 artifacts: {missing_txt}"
+                debug_log.append(self._b1_load_error)
         except Exception as e:
             import traceback
             debug_log.append(f"B1 LOAD FAILED: {str(e)}")
             debug_log.append(traceback.format_exc())
+            self._b1_load_error = f"B1 artifact load failed: {type(e).__name__}: {e}"
         
         # Try to load Branch 3 sklearn files (optional)
         self._b3_available = False
+        self._b3_load_error = None
         try:
             debug_log.append(f"B3 model exists: {self.paths['b3_model'].exists()}")
             debug_log.append(f"B3 snippet exists: {self.paths['b3_snippet'].exists()}")
@@ -295,26 +484,29 @@ class VeriFactEngine:
                 debug_log.append("B3 domain loaded OK")
                 self._b3_available = True
             else:
-                debug_log.append("B3 files missing")
+                missing = [
+                    str(self.paths["b3_model"].name) if not self.paths["b3_model"].exists() else "",
+                    str(self.paths["b3_snippet"].name) if not self.paths["b3_snippet"].exists() else "",
+                    str(self.paths["b3_domain"].name) if not self.paths["b3_domain"].exists() else "",
+                ]
+                missing_txt = ", ".join([m for m in missing if m])
+                self._b3_load_error = f"Missing Branch 3 artifacts: {missing_txt}"
+                debug_log.append(self._b3_load_error)
         except Exception as e:
             import traceback
             debug_log.append(f"B3 LOAD FAILED: {str(e)}")
             debug_log.append(traceback.format_exc())
+            self._b3_load_error = f"B3 artifact load failed: {type(e).__name__}: {e}"
         
-        # Write debug log to file
+        self._init_ddgs(debug_log)
+
+        # Write debug log to file after DDGS init so runtime state is captured in one place.
         try:
             log_path = self.base_dir / "outputs" / "sklearn_load_debug.log"
-            with open(log_path, "w") as f:
+            with open(log_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(debug_log))
-        except:
+        except OSError:
             pass
-        
-        try:
-            self._ddgs = DDGS()
-            debug_log.append("✓ DDGS initialized")
-        except Exception as e:
-            debug_log.append(f"DDGS init error: {str(e)}")
-            self._ddgs = None
         
         self._sk_ready = True
 
@@ -352,21 +544,58 @@ class VeriFactEngine:
         except Exception:
             return ""
 
+    @staticmethod
+    def _b1_similarity_to_prob_fake(similarity: float) -> float:
+        # High caption-text similarity generally indicates stronger consistency, thus lower fake probability.
+        return float(np.clip(0.5 - (0.6 * similarity), 0.05, 0.95))
+
+    @staticmethod
+    def _friendly_b1_load_error(raw_error: str | None) -> str:
+        if not raw_error:
+            return "Branch 1 classifier artifact could not be loaded in this environment."
+
+        txt = str(raw_error).lower()
+        if "bitgenerator" in txt or "__setstate__" in txt or "legacy mt19937 state" in txt:
+            return (
+                "Legacy Branch 1 classifier artifact is not compatible with the current Python/NumPy stack."
+            )
+
+        if "inconsistentversionwarning" in txt or "version" in txt:
+            return "Branch 1 classifier artifact version does not match current sklearn runtime."
+
+        return "Branch 1 classifier artifact could not be loaded in this environment."
+
     def branch1_detailed(self, image_path: str | None, text: str) -> dict[str, Any]:
         detail: dict[str, Any] = {
-            "branch": "Branch 1 — Vision (BLIP-2 + similarity)",
+            "branch": "Branch 1 — Vision (caption + similarity)",
             "image_provided": bool(image_path),
+            "caption_model": self._b1_caption_model_id,
+            "fallback_enabled": self._b1_allow_similarity_fallback,
         }
         if not image_path:
             detail["disabled"] = True
             detail["reason"] = "No image provided; vision branch is not run and gets no ensemble weight."
             return detail
-        
-        if not self._b1_available:
+
+        if not self._torch_ready:
             detail["disabled"] = True
-            detail["reason"] = "Branch 1 sklearn files not available (best_clf.pkl, scaler.pkl missing)."
+            detail["reason"] = self._b1_runtime_error or "Branch 1 caption model runtime unavailable."
             detail["prob_fake"] = 0.5
             return detail
+
+        if not self._b1_available and not self._b1_allow_similarity_fallback:
+            detail["disabled"] = True
+            detail["reason"] = self._b1_load_error or "Branch 1 sklearn artifacts unavailable."
+            detail["prob_fake"] = 0.5
+            return detail
+
+        if not self._b1_available and self._b1_allow_similarity_fallback:
+            detail["warning"] = (
+                "Branch 1 sklearn artifacts could not be loaded. "
+                "Using similarity fallback probability for this request."
+            )
+            detail["fallback_reason"] = self._friendly_b1_load_error(self._b1_load_error)
+            detail["fallback_reason_debug"] = self._b1_load_error or "Unknown sklearn load error."
 
         from sentence_transformers import util
 
@@ -380,9 +609,16 @@ class VeriFactEngine:
             detail["cosine_similarity_caption_vs_text"] = round(sim, 6)
             wc = len(caption.split()) if caption else 0
             detail["caption_word_count"] = wc
-            feats = self._b1_scaler.transform([[sim, wc]])
-            detail["scaled_features"] = [round(float(feats[0][0]), 6), float(wc)]
-            prob_fake = float(self._b1_clf.predict_proba(feats)[0][1])
+
+            if self._b1_available:
+                detail["classifier_mode"] = "artifact_classifier"
+                feats = self._b1_scaler.transform([[sim, wc]])
+                detail["scaled_features"] = [round(float(feats[0][0]), 6), float(wc)]
+                prob_fake = float(self._b1_clf.predict_proba(feats)[0][1])
+            else:
+                detail["classifier_mode"] = "similarity_fallback"
+                prob_fake = self._b1_similarity_to_prob_fake(sim)
+
             detail["prob_fake"] = round(prob_fake, 4)
         except Exception as exc:
             detail["error"] = str(exc)
@@ -405,25 +641,36 @@ class VeriFactEngine:
             detail["prob_fake"] = 0.5
         return detail
 
-    def branch3_detailed(self, text: str, image_path: str | None) -> dict[str, Any]:
+    def branch3_detailed(self, text: str, image_path: str | None, fast_mode: bool = False) -> dict[str, Any]:
         detail: dict[str, Any] = {"branch": "Branch 3 — OSINT + Random Forest"}
+
+        text_max_results = FAST_DDG_TEXT_MAX_RESULTS if fast_mode else DDG_TEXT_MAX_RESULTS
+        ddg_retry_attempts = FAST_DDG_RETRY_ATTEMPTS if fast_mode else DDG_RETRY_ATTEMPTS
+        skip_image_hash = fast_mode and FAST_SKIP_IMAGE_HASH
+        detail["fast_mode"] = fast_mode
+        detail["ddg_budget"] = {
+            "max_text_results": text_max_results,
+            "retry_attempts": ddg_retry_attempts,
+            "skip_image_hash": skip_image_hash,
+        }
         
         if not self._b3_available:
             detail["disabled"] = True
-            detail["reason"] = "Branch 3 sklearn files not available (branch3_v2_*.pkl missing)."
+            detail["reason"] = self._b3_load_error or "Branch 3 sklearn artifacts unavailable."
             detail["prob_fake"] = 0.5
             return detail
         
         if not self._ddgs:
+            self._init_ddgs()
+
+        if not self._ddgs:
             detail["disabled"] = True
-            detail["reason"] = "DuckDuckGo search not available (DDGS init failed)."
+            detail["reason"] = (
+                "DuckDuckGo search not available "
+                f"(DDGS init failed: {self._ddgs_error or 'unknown'})."
+            )
             detail["prob_fake"] = 0.5
             return detail
-
-        fact_checkers = [
-            "snopes","politifact","factcheck","reuters",
-            "apnews","leadstories","fullfact","afp","usatoday"
-        ]
 
         debunk_words = [
             "false","fake","hoax","debunked","misleading",
@@ -431,9 +678,7 @@ class VeriFactEngine:
         ]
 
         true_words = ["true","correct","accurate","authentic","verified","real"]
-
-        whitelist = ['reuters.com','apnews.com','bbc.com','thehindu.com','nytimes.com','cnn.com','ndtv.com']
-        blacklist = ['theonion.com','infowars.com','breitbart.com','babylonbee.com']
+        fact_check_phrases = ["fact check", "fact-check", "factcheck", "verified by", "verification"]
 
         try:
             # ================================
@@ -449,28 +694,98 @@ class VeriFactEngine:
 
             words = [w for w in clean_text.split() if w.lower() not in stopwords]
             headline = " ".join(words[:10])
+            if not headline:
+                headline = re.sub(r"\s+", " ", str(text)).strip()[:120] or "latest news claim"
             detail["search_query_headline"] = headline
+            query_variants = [headline]
+            if len(headline.split()) >= 4:
+                quoted = f'"{headline}"'
+                if quoted not in query_variants:
+                    query_variants.append(quoted)
+            detail["search_query_variants"] = query_variants
 
             # ================================
             # SEARCH + DOMAIN LOGIC
             # ================================
             snippets_combined, domains_combined = "", ""
-            trusted_score, suspicious_score = 0, 0
+            agreeing_results = 0
+            strong_agreeing_results = 0
 
-            results = list(self._ddgs.text(headline, max_results=5))
+            # Try an exact phrase variant if the primary query is weak, then merge unique results.
+            results: list[dict[str, Any]] = []
+            ddg_errors: list[str] = []
+            seen_result_ids: set[str] = set()
+            for idx, query_text in enumerate(query_variants):
+                variant_results, variant_errors = self._ddg_text_search(
+                    query_text,
+                    max_results=text_max_results,
+                    retry_attempts=ddg_retry_attempts,
+                )
+                if variant_errors:
+                    ddg_errors.extend([f"{query_text} :: {err}" for err in variant_errors])
+
+                for item in variant_results:
+                    href = str(item.get("href", "")).strip().lower()
+                    if href:
+                        result_id = href
+                    else:
+                        title = str(item.get("title", "")).strip().lower()
+                        body = str(item.get("body", "")).strip().lower()[:120]
+                        result_id = f"{title}::{body}"
+
+                    if result_id in seen_result_ids:
+                        continue
+                    seen_result_ids.add(result_id)
+                    results.append(item)
+                    if len(results) >= text_max_results:
+                        break
+
+                if len(results) >= text_max_results:
+                    break
+                # If the first query already returned enough material, skip the fallback query.
+                if idx == 0 and len(results) >= max(2, text_max_results // 2):
+                    break
+
             detail["ddg_text_hits"] = len(results)
+            if ddg_errors:
+                detail["ddg_errors"] = ddg_errors
 
             preview_snips = []
             preview_domains = []
+            preview_links = []
             seen_domains = set()
+
+            # Measure source consensus directly from retrieved text instead of hardcoding domain trust.
+            query_tokens = [w.lower() for w in words[:12] if len(w) >= 3]
+            query_token_set = set(query_tokens)
 
             for res in results:
                 body = str(res.get("body", ""))
                 href = res.get("href", "")
+                title = str(res.get("title", "")).strip()
+                combined_text = f"{title} {body}".lower()
 
                 dom = urlparse(href).netloc.replace("www.", "").lower()
 
-                snippets_combined += body.lower() + " || "
+                snippets_combined += combined_text + " || "
+
+                if isinstance(href, str) and href.startswith(("http://", "https://")):
+                    preview_links.append(
+                        {
+                            "title": title,
+                            "url": href,
+                            "domain": dom,
+                            "snippet": body[:200],
+                        }
+                    )
+
+                if query_token_set:
+                    overlap = sum(1 for t in query_token_set if t in combined_text)
+                    overlap_ratio = overlap / max(1, len(query_token_set))
+                    if overlap_ratio >= 0.45:
+                        agreeing_results += 1
+                    if overlap_ratio >= 0.70:
+                        strong_agreeing_results += 1
 
                 if dom and dom not in seen_domains:
                     domains_combined += dom + " "
@@ -478,37 +793,49 @@ class VeriFactEngine:
                     preview_domains.append(dom)
                     seen_domains.add(dom)
 
-                    if any(w in dom for w in whitelist):
-                        trusted_score += 1
-                    if any(b in dom for b in blacklist):
-                        suspicious_score += 1
-
             detail["result_snippets_preview"] = preview_snips
             detail["result_domains"] = preview_domains
+            detail["result_links"] = preview_links
+
+            unique_domains = len(preview_domains)
+            text_hits = len(results)
+            consensus_ratio = (agreeing_results / text_hits) if text_hits > 0 else 0.0
 
             # ================================
             # HYBRID OVERRIDE
             # ================================
-            has_fc = any(fc in domains_combined for fc in fact_checkers)
+            has_fc = any(phrase in snippets_combined for phrase in fact_check_phrases)
             has_debunk = any(dw in snippets_combined for dw in debunk_words)
             has_true = any(tw in snippets_combined for tw in true_words)
 
             detail["signals"] = {
-                "trusted_sources": trusted_score,
-                "suspicious_sources": suspicious_score,
+                "supporting_sources": agreeing_results,
+                "contradicting_sources": 0,
+                "text_hits": text_hits,
+                "agreeing_results": agreeing_results,
+                "strong_agreeing_results": strong_agreeing_results,
+                "unique_domains": unique_domains,
+                "consensus_ratio": round(consensus_ratio, 4),
                 "fact_checker_hit": has_fc,
                 "debunk_language": has_debunk,
-                "verification_language": has_true
+                "verification_language": has_true,
+                # Backward-compatible keys used by some older templates.
+                "trusted_sources": agreeing_results,
+                "suspicious_sources": 0,
+                "fact_checker_domain_hit": has_fc,
+                "debunk_language_in_snippets": has_debunk,
+                "verification_language_in_snippets": has_true,
             }
 
-            if suspicious_score >= 2:
-                detail["decision_path"] = "Override → suspicious domains"
-                detail["prob_fake"] = 0.9
-                return detail
-
-            if trusted_score >= 2 and not has_debunk:
-                detail["decision_path"] = "Override → trusted domains"
-                detail["prob_fake"] = 0.1
+            # If multiple sources independently align with the query and no debunk signal appears,
+            # treat it as verification-style evidence.
+            if text_hits >= 2 and unique_domains >= 2 and agreeing_results >= 2 and not has_debunk:
+                if agreeing_results == text_hits or consensus_ratio >= 0.8:
+                    detail["decision_path"] = "Override → multi-source consensus"
+                    detail["prob_fake"] = 0.08
+                else:
+                    detail["decision_path"] = "Override → partial source consensus"
+                    detail["prob_fake"] = 0.2
                 return detail
 
             if has_fc and has_debunk:
@@ -531,17 +858,32 @@ class VeriFactEngine:
 
             hash_dist, has_exif = -1, 0
 
-            if image_path:
+            if image_path and imagehash is not None and not skip_image_hash:
                 try:
                     local_hash = imagehash.phash(Image.open(image_path))
-                    ddg_imgs = list(self._ddgs.images(headline, max_results=1))
+                    ddg_imgs, ddg_img_errors = self._ddg_image_search(
+                        headline,
+                        max_results=DDG_IMAGE_MAX_RESULTS,
+                        retry_attempts=ddg_retry_attempts,
+                    )
+                    if ddg_img_errors:
+                        detail["ddg_image_errors"] = ddg_img_errors
                     if ddg_imgs:
-                        resp = requests.get(ddg_imgs[0]["image"], timeout=3)
+                        resp = requests.get(
+                            ddg_imgs[0]["image"],
+                            timeout=5,
+                            headers={"User-Agent": "VeriFact/1.0 (+osint-image-check)"},
+                        )
+                        resp.raise_for_status()
                         hash_dist = local_hash - imagehash.phash(Image.open(io.BytesIO(resp.content)))
-                except:
+                except Exception:
                     pass
+            elif image_path and skip_image_hash:
+                detail["image_hash_skipped_reason"] = "Fast mode enabled; OSINT image hash check skipped."
+            elif image_path and imagehash is None:
+                detail["image_hash_skipped_reason"] = "ImageHash package not installed; OSINT image hash check skipped."
 
-            fc_count = sum(1 for d in fact_checkers if d in domains_combined)
+            fc_count = sum(snippets_combined.count(p) for p in fact_check_phrases)
             debunk_count = sum(snippets_combined.count(w) for w in debunk_words)
             legit_count = sum(snippets_combined.count(w) for w in true_words)
 
@@ -558,7 +900,23 @@ class VeriFactEngine:
             classes = list(self._b3_model.classes_)
             fake_idx = classes.index(0)
 
-            prob_fake = float(self._b3_model.predict_proba(X_live)[0][fake_idx])
+            raw_prob_fake = float(self._b3_model.predict_proba(X_live)[0][fake_idx])
+
+            evidence_strength = (
+                0.25 * min(1.0, text_hits / max(1.0, float(text_max_results)))
+                + 0.35 * min(1.0, max(0.0, consensus_ratio))
+                + 0.20 * min(1.0, unique_domains / 4.0)
+                + 0.20 * float(has_fc or has_debunk or has_true)
+            )
+            evidence_floor = min(1.0, max(0.0, B3_RF_EVIDENCE_FLOOR))
+            evidence_strength = min(1.0, max(evidence_floor, evidence_strength))
+            prob_fake = 0.5 + ((raw_prob_fake - 0.5) * evidence_strength)
+
+            if evidence_strength < 0.45:
+                detail["decision_path"] = "RandomForest fallback (low-evidence smoothing)"
+
+            detail["rf_raw_prob_fake"] = round(raw_prob_fake, 4)
+            detail["evidence_strength"] = round(evidence_strength, 4)
             detail["prob_fake"] = round(prob_fake, 4)
 
         except Exception as exc:
@@ -572,13 +930,14 @@ class VeriFactEngine:
         text: str,
         image_path: str | None = None,
         threshold: float = 0.5,
+        fast_mode: bool = False,
     ) -> dict[str, Any]:
         use_b1 = bool(image_path)  # Whether image was provided
         self.load_all(use_branch1_vision=use_b1)
 
         d1 = self.branch1_detailed(image_path, text)
         d2 = self.branch2_detailed(text)
-        d3 = self.branch3_detailed(text, image_path)
+        d3 = self.branch3_detailed(text, image_path, fast_mode=fast_mode)
 
         # Check which branches are actually available (not disabled)
         b1_disabled = d1.get("disabled", False)
@@ -614,7 +973,21 @@ class VeriFactEngine:
             w3 = 0.0
             final_score = p2
 
-        final_label = "FAKE" if final_score >= threshold else "REAL"
+        active_branch_count = int(not b1_disabled) + int(not b3_disabled) + 1
+        effective_threshold = float(threshold)
+        decision_notes: list[str] = []
+
+        if active_branch_count == 1:
+            effective_threshold = max(effective_threshold, min(1.0, SINGLE_BRANCH_FAKE_THRESHOLD))
+            decision_notes.append(
+                "Only one branch is active, so a stricter fake threshold was used to reduce false positives."
+            )
+        if b3_disabled:
+            decision_notes.append(
+                f"OSINT branch unavailable: {d3.get('reason', 'Branch 3 disabled.')}"
+            )
+
+        final_label = "FAKE" if final_score >= effective_threshold else "REAL"
         confidence = final_score if final_label == "FAKE" else (1.0 - final_score)
 
         wc1 = round(w1 * p1, 6) if p1 is not None else 0.0
@@ -622,6 +995,12 @@ class VeriFactEngine:
 
         return {
             "threshold": threshold,
+            "effective_threshold": round(float(effective_threshold), 4),
+            "fast_mode": fast_mode,
+            "decision_context": {
+                "active_branches": active_branch_count,
+                "notes": decision_notes,
+            },
             "nominal_weights": {
                 "branch1": ENSEMBLE_W1,
                 "branch2": ENSEMBLE_W2,
@@ -652,8 +1031,7 @@ def analyze_text_image(
     image_path: str | None = None,
     threshold: float = 0.5,
     base_dir: Path | None = None,
+    fast_mode: bool = False,
 ) -> dict[str, Any]:
     engine = VeriFactEngine.get(base_dir)
-    return engine.analyze(text, image_path=image_path, threshold=threshold)
-
-print(list(DDGS().text("test")))
+    return engine.analyze(text, image_path=image_path, threshold=threshold, fast_mode=fast_mode)

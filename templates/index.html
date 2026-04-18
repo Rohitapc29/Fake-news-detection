@@ -4,55 +4,88 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>VeriFact — Fake News Detector</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+    rel="stylesheet"
+  />
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
-  <style>
-    .insight-box { background: #f9f9f9; border-radius: 8px; padding: 1.5rem; margin-bottom: 1rem; border: 1px solid #e0e0e0; }
-    .insight-box h4 { margin: 0 0 0.75rem 0; color: #222; font-size: 0.95rem; font-weight: 600; }
-    .insight-box p { margin: 0.5rem 0; font-size: 0.9rem; color: #333; }
-    .insight-box pre { margin: 0; font-size: 0.85rem; color: #555; white-space: pre-wrap; word-wrap: break-word; }
-  </style>
 </head>
 <body>
   <div class="page">
     <header class="hero">
-      <h1>VeriFact</h1>
-      <p class="tagline">AI-powered fake news detector using vision, text, and web research.</p>
+      <div class="hero-main">
+        <p class="eyebrow">VeriFact Engineering Console</p>
+        <h1>Tri-Modal Misinformation Analysis</h1>
+        <p class="tagline">
+          Investigate user claims through Branch 1 (vision-caption similarity), Branch 2 (BiLSTM text),
+          and Branch 3 (live DuckDuckGo OSINT).
+        </p>
+      </div>
+      <div class="hero-meta">
+        <span class="meta-chip">Branch 1: Caption Model + SBERT</span>
+        <span class="meta-chip">Branch 2: IFND BiLSTM</span>
+        <span class="meta-chip">Branch 3: DDG + RandomForest</span>
+      </div>
       {% if artifact_status != 'ready' %}
       <div class="banner warn">
         <strong>Artifacts missing.</strong> Expected files under <code>{{ base_dir }}/outputs/</code>.
         {% if missing_artifacts %}Missing: {{ missing_artifacts }}.{% endif %}
       </div>
       {% endif %}
+      <a class="diag-link" href="/api/diagnostics" target="_blank" rel="noopener">Open runtime diagnostics</a>
     </header>
 
     <main class="grid">
       <section class="card panel">
-        <h2>Check a Story</h2>
+        <h2>Analyze Claim</h2>
+        <p class="panel-intro">
+          Paste article text or a headline, optionally attach an image, and run the ensemble inference.
+        </p>
         <form id="analyze-form">
           <label class="field">
-            <span>News text <span class="req">*</span></span>
-            <textarea name="text" id="text-input" rows="8" placeholder="Paste headline or article text…" required></textarea>
+            <span>Claim text <span class="req">*</span></span>
+            <textarea
+              name="text"
+              id="text-input"
+              rows="9"
+              placeholder="Paste headline or article text for tri-modal analysis"
+              required
+            ></textarea>
           </label>
 
           <label class="field">
-            <span>Optional image</span>
+            <span>Supporting image (optional)</span>
             <input type="file" name="image" id="image-input" accept="image/jpeg,image/png,image/webp,image/gif,image/bmp" />
-            <small class="hint">Add an image to enable visual analysis.</small>
+            <small class="hint">Attach an image to enable Branch 1 vision analysis.</small>
           </label>
 
-          <button type="submit" id="submit-btn" class="btn primary">Analyze</button>
+          <label class="field inline">
+            <span>Decision threshold</span>
+            <input type="number" id="threshold-input" name="threshold" min="0" max="1" step="0.01" value="0.50" />
+            <small class="hint">FAKE if final score is greater than or equal to this value.</small>
+          </label>
+
+          <label class="field inline toggle-row">
+            <span>Fast mode</span>
+            <input type="checkbox" id="fast-mode-input" name="fast_mode" checked />
+            <small class="hint">Uses fewer OSINT calls and retries for faster demo responses.</small>
+          </label>
+
+          <button type="submit" id="submit-btn" class="btn primary">Run Analysis</button>
         </form>
         <p id="status" class="status" aria-live="polite"></p>
       </section>
 
       <section class="card results" id="results-panel" hidden>
-        <h2>Result</h2>
+        <h2>Inference Result</h2>
         <div class="final-box" id="final-summary"></div>
         
-        <div id="insights-column" style="margin-top: 2rem;"></div>
+        <div id="insights-column" class="insights-column"></div>
         
-        <details class="raw-json" style="margin-top: 2rem;">
-          <summary>View detailed results</summary>
+        <details class="raw-json">
+          <summary>View raw JSON response</summary>
           <pre id="raw-out"></pre>
         </details>
       </section>
@@ -71,6 +104,8 @@
     const insightsColumn = document.getElementById('insights-column');
     const rawOut = document.getElementById('raw-out');
     const submitBtn = document.getElementById('submit-btn');
+    const thresholdInput = document.getElementById('threshold-input');
+    const fastModeInput = document.getElementById('fast-mode-input');
 
     function esc(s) {
       const d = document.createElement('div');
@@ -78,83 +113,243 @@
       return d.innerHTML;
     }
 
+    function pct(v) {
+      if (typeof v !== 'number' || Number.isNaN(v)) return 'n/a';
+      return Math.round(v * 100) + '%';
+    }
+
+    function safeUrl(url) {
+      try {
+        const parsed = new URL(String(url || ''), window.location.origin);
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+          return parsed.href;
+        }
+      } catch (_) {
+        // Ignore malformed URLs and fall back to '#'.
+      }
+      return '#';
+    }
+
+    function branchCardHtml(title, b, flavorClass) {
+      const disabled = Boolean(b && b.disabled);
+      const probLine = (b && typeof b.prob_fake === 'number')
+        ? ('<p class="branch-prob">Fake probability: <strong>' + pct(b.prob_fake) + '</strong></p>')
+        : '<p class="branch-prob muted">Probability unavailable</p>';
+      const reasonLine = (b && b.reason)
+        ? ('<p class="branch-note">' + esc(b.reason) + '</p>')
+        : '';
+      const statusPill = disabled
+        ? '<span class="branch-pill is-disabled">Disabled</span>'
+        : '<span class="branch-pill is-active">Active</span>';
+
+      let body = '';
+      if (b && b.caption) {
+        body += '<p class="branch-text"><span class="mono">Caption:</span> ' + esc(b.caption) + '</p>';
+      }
+      if (b && b.search_query_headline) {
+        body += '<p class="branch-text"><span class="mono">Query:</span> ' + esc(b.search_query_headline) + '</p>';
+      }
+      if (b && b.decision_path) {
+        body += '<p class="branch-text"><span class="mono">Path:</span> ' + esc(b.decision_path) + '</p>';
+      }
+      if (b && typeof b.rf_raw_prob_fake === 'number') {
+        body += '<p class="branch-text"><span class="mono">RF raw:</span> ' + pct(b.rf_raw_prob_fake) + '</p>';
+      }
+      if (b && typeof b.evidence_strength === 'number') {
+        body += '<p class="branch-text"><span class="mono">Evidence strength:</span> ' + pct(b.evidence_strength) + '</p>';
+      }
+      if (b && b.classifier_mode) {
+        body += '<p class="branch-text"><span class="mono">Mode:</span> ' + esc(b.classifier_mode) + '</p>';
+      }
+      if (b && b.fallback_reason) {
+        body += '<p class="branch-note">Fallback reason: ' + esc(b.fallback_reason) + '</p>';
+      }
+      if (b && b.error) {
+        body += '<p class="branch-error">Error: ' + esc(b.error) + '</p>';
+      }
+
+      return (
+        '<article class="branch-card ' + flavorClass + (disabled ? ' state-disabled' : ' state-active') + '">' +
+          '<div class="branch-head">' +
+            '<h4>' + esc(title) + '</h4>' +
+            statusPill +
+          '</div>' +
+          probLine +
+          reasonLine +
+          body +
+        '</article>'
+      );
+    }
+
+    function signalValue(signals, modernKey, legacyKey) {
+      if (!signals) return false;
+      if (Object.prototype.hasOwnProperty.call(signals, modernKey)) {
+        return Boolean(signals[modernKey]);
+      }
+      if (Object.prototype.hasOwnProperty.call(signals, legacyKey)) {
+        return Boolean(signals[legacyKey]);
+      }
+      return false;
+    }
+
+    function weightRow(label, value, className) {
+      const percent = (typeof value === 'number' && !Number.isNaN(value)) ? Math.round(value * 100) : 0;
+      return (
+        '<div class="weight-row">' +
+          '<div class="weight-head"><span>' + esc(label) + '</span><strong>' + percent + '%</strong></div>' +
+          '<div class="weight-track"><div class="weight-fill ' + className + '" style="width:' + percent + '%"></div></div>' +
+        '</div>'
+      );
+    }
+
+    function setStatus(text, tone) {
+      statusEl.textContent = text;
+      statusEl.className = 'status';
+      if (tone) {
+        statusEl.classList.add(tone);
+      }
+    }
+
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      statusEl.textContent = 'Analyzing…';
+      const fastModeOn = Boolean(fastModeInput && fastModeInput.checked);
+      setStatus(
+        fastModeOn ? 'Running fast-mode inference across available branches...' : 'Running full inference across available branches...',
+        'busy'
+      );
       resultsPanel.hidden = true;
       submitBtn.disabled = true;
+      submitBtn.textContent = 'Running...';
 
       const fd = new FormData(form);
-      fd.set('threshold', '0.5');
+      const thresholdValue = Number(thresholdInput.value);
+      if (Number.isFinite(thresholdValue)) {
+        const clamped = Math.max(0, Math.min(1, thresholdValue));
+        fd.set('threshold', String(clamped));
+      } else {
+        fd.set('threshold', '0.5');
+      }
+      fd.set('fast_mode', fastModeOn ? '1' : '0');
 
       try {
         const res = await fetch('/api/analyze', { method: 'POST', body: fd });
-        const data = await res.json();
-        rawOut.textContent = JSON.stringify(data, null, 2);
+        const rawText = await res.text();
+        let data = null;
+        try {
+          data = JSON.parse(rawText);
+          rawOut.textContent = JSON.stringify(data, null, 2);
+        } catch {
+          rawOut.textContent = rawText;
+        }
 
-        if (!data.ok) {
-          let msg = data.error || 'Request failed';
-          if (data.detail) {
+        if (!res.ok || !data || !data.ok) {
+          let msg = 'Request failed';
+          if (data && data.error) {
+            msg = data.error;
+          }
+          if (data && data.detail) {
             msg += '\n\n' + String(data.detail).slice(0, 4000);
           }
-          statusEl.textContent = msg;
+          setStatus(msg, 'error');
           submitBtn.disabled = false;
+          submitBtn.textContent = 'Run Analysis';
           return;
         }
 
-        statusEl.textContent = '';
-        const ens = data.ensemble;
+        setStatus('Analysis completed.', 'ok');
+        const ens = data.ensemble || {};
+        const fastModeApplied = Boolean(data.fast_mode);
         const labelClass = ens.final_label === 'FAKE' ? 'fake' : 'real';
-        const confidence = Math.round(ens.confidence_for_label * 100);
+        const confidence = pct(ens.confidence_for_label);
+        const finalScore = pct(ens.final_score_fake);
+        const effectiveThreshold = (typeof data.effective_threshold === 'number')
+          ? data.effective_threshold
+          : (Number.isFinite(Number(data.threshold)) ? Number(data.threshold) : 0.5);
+        const contextNotes = (data.decision_context && Array.isArray(data.decision_context.notes))
+          ? data.decision_context.notes
+          : [];
         
         finalSummary.innerHTML =
-          '<div class="label-pill ' + labelClass + '">' + esc(ens.final_label) + '</div>' +
-          '<p class="scores"><strong>' + confidence + '% confidence</strong></p>';
+          '<div class="result-head">' +
+            '<div class="label-pill ' + labelClass + '">' + esc(ens.final_label || 'UNKNOWN') + '</div>' +
+            '<p class="scores"><strong>Confidence: ' + confidence + '</strong></p>' +
+          '</div>' +
+          '<p class="score-line">Final fake score: <strong>' + finalScore + '</strong></p>' +
+          '<p class="score-line">Effective threshold: <strong>' + pct(effectiveThreshold) + '</strong></p>' +
+          '<p class="score-line">Mode: <strong>' + (fastModeApplied ? 'Fast' : 'Full') + '</strong></p>';
+
+        if (contextNotes.length > 0) {
+          finalSummary.innerHTML += '<p class="score-line">Context: <strong>' + esc(contextNotes.join(' | ')) + '</strong></p>';
+        }
 
         // Build insights panel
         let insightsHtml = '';
+        const branches = data.branches || {};
+        const b1 = branches.branch1 || {};
+        const b2 = branches.branch2 || {};
+        const b3 = branches.branch3 || {};
 
-        // BLIP caption (if available)
-        const b1 = data.branches.branch1;
-        if (b1.caption && !b1.disabled) {
-          insightsHtml += '<div class="insight-box"><h4>📷 BLIP Image Analysis</h4><p>' + esc(b1.caption) + '</p></div>';
-        }
+        insightsHtml +=
+          '<section class="insight-box">' +
+            '<h3>Branch Diagnostics</h3>' +
+            '<div class="branch-grid">' +
+              branchCardHtml('Branch 1 - Vision (Caption)', b1, 'vision') +
+              branchCardHtml('Branch 2 - BiLSTM Text', b2, 'text') +
+              branchCardHtml('Branch 3 - OSINT (DDG + RF)', b3, 'osint') +
+            '</div>' +
+          '</section>';
 
         // OSINT summary (if available)
-        const b3 = data.branches.branch3;
         if (!b3.disabled && b3.ddg_text_hits) {
-          insightsHtml += '<div class="insight-box"><h4>🔍 Web Search (OSINT)</h4>';
-          insightsHtml += '<p><strong>' + b3.ddg_text_hits + ' results found</strong> from web search</p>';
+          insightsHtml += '<section class="insight-box"><h3>OSINT Search Summary</h3>';
+          insightsHtml += '<p><strong>' + b3.ddg_text_hits + ' results</strong> collected from DuckDuckGo.</p>';
           if (b3.result_domains && b3.result_domains.length > 0) {
-            insightsHtml += '<p style="font-size:0.85rem; margin-top:0.5rem; color:#555;"><strong>Websites checked:</strong></p>';
-            insightsHtml += '<p style="font-size:0.85rem; margin:0.25rem 0; color:#666;">' + esc(b3.result_domains.join(' • ')) + '</p>';
+            insightsHtml += '<p class="mono"><strong>Domains:</strong> ' + esc(b3.result_domains.join(' | ')) + '</p>';
           }
-          if (b3.signals) {
-            insightsHtml += '<div style="margin-top:0.75rem; padding-top:0.75rem; border-top:1px solid #ddd;">';
-            if (b3.signals.fact_checker_domain_hit) insightsHtml += '<p style="margin:0.25rem 0; color:#27ae60;">✓ Fact-checker domain mentioned</p>';
-            if (b3.signals.debunk_language_in_snippets) insightsHtml += '<p style="margin:0.25rem 0; color:#e74c3c;">✓ Debunk language detected</p>';
-            if (b3.signals.verification_language_in_snippets) insightsHtml += '<p style="margin:0.25rem 0; color:#27ae60;">✓ Verification language detected</p>';
+          if (b3.result_links && b3.result_links.length > 0) {
+            insightsHtml += '<div class="osint-links">';
+            insightsHtml += '<p><strong>Sources:</strong></p>';
+            insightsHtml += '<ul class="osint-link-list">';
+            b3.result_links.slice(0, 8).forEach((item, idx) => {
+              const title = item.title || item.domain || ('Result ' + (idx + 1));
+              const href = safeUrl(item.url || item.href || '');
+              const domain = item.domain ? ' <span class="osint-domain">(' + esc(item.domain) + ')</span>' : '';
+              insightsHtml += '<li><a href="' + esc(href) + '" target="_blank" rel="noopener noreferrer">' + esc(title) + '</a>' + domain + '</li>';
+            });
+            insightsHtml += '</ul>';
             insightsHtml += '</div>';
           }
-          insightsHtml += '</div>';
+          if (b3.signals) {
+            const fcHit = signalValue(b3.signals, 'fact_checker_hit', 'fact_checker_domain_hit');
+            const debunkHit = signalValue(b3.signals, 'debunk_language', 'debunk_language_in_snippets');
+            const verifyHit = signalValue(b3.signals, 'verification_language', 'verification_language_in_snippets');
+
+            insightsHtml += '<div class="signal-grid">';
+            insightsHtml += '<div class="signal-item ' + (fcHit ? 'on' : 'off') + '">Fact-check source signal</div>';
+            insightsHtml += '<div class="signal-item ' + (debunkHit ? 'on' : 'off') + '">Debunking language signal</div>';
+            insightsHtml += '<div class="signal-item ' + (verifyHit ? 'on' : 'off') + '">Verification language signal</div>';
+            insightsHtml += '</div>';
+          }
+          insightsHtml += '</section>';
         }
 
         // Model weights breakdown
-        const w = data.weights;
+        const w = data.weights || {};
         if (w.branch1 > 0 || w.branch2 > 0 || w.branch3 > 0) {
-          insightsHtml += '<div class="insight-box"><h4>⚖️ Model Weights</h4>';
-          if (w.branch1 > 0) insightsHtml += '<p><strong>Vision:</strong> ' + Math.round(w.branch1 * 100) + '%</p>';
-          if (w.branch2 > 0) insightsHtml += '<p><strong>Text Analysis:</strong> ' + Math.round(w.branch2 * 100) + '%</p>';
-          if (w.branch3 > 0) insightsHtml += '<p><strong>Web Research:</strong> ' + Math.round(w.branch3 * 100) + '%</p>';
-          insightsHtml += '</div>';
+          insightsHtml += '<section class="insight-box"><h3>Effective Ensemble Weights</h3>';
+          insightsHtml += weightRow('Vision branch', w.branch1, 'vision');
+          insightsHtml += weightRow('Text branch', w.branch2, 'text');
+          insightsHtml += weightRow('OSINT branch', w.branch3, 'osint');
+          insightsHtml += '</section>';
         }
 
         insightsColumn.innerHTML = insightsHtml;
         resultsPanel.hidden = false;
       } catch (err) {
-        statusEl.textContent = 'Network or server error: ' + err;
+        setStatus('Network or server error: ' + err, 'error');
       } finally {
         submitBtn.disabled = false;
+        submitBtn.textContent = 'Run Analysis';
       }
     });
   </script>
