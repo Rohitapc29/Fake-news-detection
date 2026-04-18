@@ -1,18 +1,16 @@
-# Ignore virtual environment
-tf_env/
-
-# Ignore Python cache
+# Ignore Python cache and compiled files
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
+# Ignore virtual environments
+env/
+venv/
+tf_env/
+
 # Ignore Jupyter notebook checkpoints
 .ipynb_checkpoints/
-
-# Ignore logs and outputs
-*.log
-outputs/
 
 # Ignore OS-specific files
 .DS_Store
