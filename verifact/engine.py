@@ -175,6 +175,27 @@ DDG_CACHE_MAX_SIZE = _env_int("VERIFACT_DDG_CACHE_MAX_SIZE", 200)
 B1_ALLOW_SIMILARITY_FALLBACK = _env_bool("VERIFACT_B1_ALLOW_SIMILARITY_FALLBACK", True)
 SINGLE_BRANCH_FAKE_THRESHOLD = _env_float("VERIFACT_SINGLE_BRANCH_FAKE_THRESHOLD", 0.62)
 B3_RF_EVIDENCE_FLOOR = _env_float("VERIFACT_B3_RF_EVIDENCE_FLOOR", 0.35)
+SATIRE_DOMAIN_BLACKLIST = {
+    "theonion.com",
+    "babylonbee.com",
+    "clickhole.com",
+    "duffelblog.com",
+    "waterfordwhispersnews.com",
+    "thebeaverton.com",
+    "newsthump.com",
+    "fakingnews.com",
+}
+SATIRE_MIN_MATCH_HITS = _env_int("VERIFACT_SATIRE_MIN_MATCH_HITS", 1)
+SATIRE_TOKEN_MATCH_THRESHOLD = _env_float("VERIFACT_SATIRE_TOKEN_MATCH_THRESHOLD", 0.6)
+SATIRE_OVERRIDE_PROB_FAKE_SINGLE = _env_float("VERIFACT_SATIRE_OVERRIDE_PROB_FAKE_SINGLE", 0.92)
+SATIRE_OVERRIDE_PROB_FAKE_MULTI = _env_float("VERIFACT_SATIRE_OVERRIDE_PROB_FAKE_MULTI", 0.98)
+
+
+def _domain_in_blacklist(domain: str, blacklist: set[str]) -> bool:
+    d = str(domain or "").strip().lower().lstrip(".")
+    if not d:
+        return False
+    return any(d == b or d.endswith(f".{b}") for b in blacklist)
 
 
 def _load_joblib_with_pickle_fallback(path: Path, label: str, debug_log: list[str] | None = None) -> Any:
@@ -758,6 +779,9 @@ class VeriFactEngine:
             # Measure source consensus directly from retrieved text instead of hardcoding domain trust.
             query_tokens = [w.lower() for w in words[:12] if len(w) >= 3]
             query_token_set = set(query_tokens)
+            headline_norm = re.sub(r"\s+", " ", headline.lower()).strip()
+            satire_match_hits = 0
+            satire_domains_found: set[str] = set()
 
             for res in results:
                 body = str(res.get("body", ""))
@@ -779,6 +803,7 @@ class VeriFactEngine:
                         }
                     )
 
+                overlap_ratio = 0.0
                 if query_token_set:
                     overlap = sum(1 for t in query_token_set if t in combined_text)
                     overlap_ratio = overlap / max(1, len(query_token_set))
@@ -786,6 +811,15 @@ class VeriFactEngine:
                         agreeing_results += 1
                     if overlap_ratio >= 0.70:
                         strong_agreeing_results += 1
+
+                # Satire override should only trigger if headline/text materially matches the claim.
+                if _domain_in_blacklist(dom, SATIRE_DOMAIN_BLACKLIST):
+                    headline_exact_match = bool(headline_norm and headline_norm in combined_text)
+                    satire_threshold = min(1.0, max(0.0, SATIRE_TOKEN_MATCH_THRESHOLD))
+                    headline_similar_match = headline_exact_match or overlap_ratio >= satire_threshold
+                    if headline_similar_match and dom not in satire_domains_found:
+                        satire_domains_found.add(dom)
+                        satire_match_hits += 1
 
                 if dom and dom not in seen_domains:
                     domains_combined += dom + " "
@@ -819,6 +853,9 @@ class VeriFactEngine:
                 "fact_checker_hit": has_fc,
                 "debunk_language": has_debunk,
                 "verification_language": has_true,
+                "satire_blacklist_hits": satire_match_hits,
+                "satire_blacklist_domains": sorted(satire_domains_found),
+                "satire_blacklist_triggered": satire_match_hits >= SATIRE_MIN_MATCH_HITS,
                 # Backward-compatible keys used by some older templates.
                 "trusted_sources": agreeing_results,
                 "suspicious_sources": 0,
@@ -826,6 +863,21 @@ class VeriFactEngine:
                 "debunk_language_in_snippets": has_debunk,
                 "verification_language_in_snippets": has_true,
             }
+
+            if has_fc and has_debunk:
+                detail["decision_path"] = "Override → fact-check debunk"
+                detail["prob_fake"] = 0.95
+                return detail
+
+            if satire_match_hits >= SATIRE_MIN_MATCH_HITS:
+                detail["decision_path"] = "Override → satire blacklist"
+                satire_prob = (
+                    SATIRE_OVERRIDE_PROB_FAKE_MULTI
+                    if satire_match_hits >= 2
+                    else SATIRE_OVERRIDE_PROB_FAKE_SINGLE
+                )
+                detail["prob_fake"] = round(float(np.clip(satire_prob, 0.5, 0.999)), 4)
+                return detail
 
             # If multiple sources independently align with the query and no debunk signal appears,
             # treat it as verification-style evidence.
@@ -836,11 +888,6 @@ class VeriFactEngine:
                 else:
                     detail["decision_path"] = "Override → partial source consensus"
                     detail["prob_fake"] = 0.2
-                return detail
-
-            if has_fc and has_debunk:
-                detail["decision_path"] = "Override → fact-check debunk"
-                detail["prob_fake"] = 0.95
                 return detail
 
             if has_fc and has_true and not has_debunk:
